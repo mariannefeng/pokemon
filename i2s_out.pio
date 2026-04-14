@@ -1,0 +1,63 @@
+;
+; I2S stereo TX for MAX98357A
+;
+; Pins:
+;   DOUT  = GP9  (out pin)
+;   BCLK  = GP10 (side-set pin 0)
+;   LRCLK = GP11 (side-set pin 1)
+;
+; TX FIFO word: [left 16b | right 16b], shifted out MSB first.
+; 64 PIO clock cycles per stereo frame.
+;
+
+.program i2s_out
+.side_set 2
+
+; side 0bXY: X = LRCLK (GP11), Y = BCLK (GP10)
+;   0b00 = BCLK↓, LRCLK=0 (left)
+;   0b01 = BCLK↑, LRCLK=0 (left)
+;   0b10 = BCLK↓, LRCLK=1 (right)
+;   0b11 = BCLK↑, LRCLK=1 (right)
+
+.wrap_target
+    set x, 14          side 0b01   ; BCLK↑, LRCLK=0 — start left channel
+left_loop:
+    out pins, 1        side 0b00   ; bit out, BCLK↓, LRCLK=0
+    jmp x-- left_loop  side 0b01   ; BCLK↑, LRCLK=0
+    out pins, 1        side 0b10   ; 16th left bit, BCLK↓, LRCLK→1
+    set x, 14          side 0b11   ; BCLK↑, LRCLK=1 — start right channel
+right_loop:
+    out pins, 1        side 0b10   ; bit out, BCLK↓, LRCLK=1
+    jmp x-- right_loop side 0b11   ; BCLK↑, LRCLK=1
+    out pins, 1        side 0b00   ; 16th right bit, BCLK↓, LRCLK→0
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void i2s_out_program_init(PIO pio, uint sm, uint offset,
+                                        uint dout_pin, uint bclk_pin,
+                                        uint32_t sample_rate) {
+                                        
+    pio_sm_config c = i2s_out_program_get_default_config(offset);
+
+    sm_config_set_out_pins(&c, dout_pin, 1);
+    sm_config_set_sideset_pins(&c, bclk_pin);
+    // MSB first, autopull at 32 bits
+    sm_config_set_out_shift(&c, false, true, 32);
+
+    // 64 PIO cycles per stereo frame
+    float div = (float)clock_get_hz(clk_sys) / ((float)sample_rate * 64.0f);
+    sm_config_set_clkdiv(&c, div);
+
+    pio_gpio_init(pio, dout_pin);
+    pio_gpio_init(pio, bclk_pin);
+    pio_gpio_init(pio, bclk_pin + 1); // LRCLK
+
+    pio_sm_set_consecutive_pindirs(pio, sm, dout_pin, 1, true);  // DOUT output
+    pio_sm_set_consecutive_pindirs(pio, sm, bclk_pin, 2, true);  // BCLK + LRCLK output
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
