@@ -15,9 +15,44 @@
 #include <math.h> 
 
 /* ── Pins ──────────────────────────────────────────────────────────────── */
-#define DOUT_PIN     9    // MAX98357A DIN
-#define BCLK_PIN    10    // MAX98357A BCLK  (LRCLK = GP11, implicit as BCLK+1)
+#define DOUT_PIN         9    // MAX98357A DIN
+#define BCLK_PIN        10    // MAX98357A BCLK  (LRCLK = GP11, implicit as BCLK+1)
 #define SAMPLE_RATE  48000
+
+/* Set GPIO per track (active low). Use PIN_UNUSED until wired. */
+#define PIN_UNUSED 255
+
+typedef struct {
+    const char *path;   /* FatFs path under mount "0:" */
+    bool        is_loop; /* true: music-* style — one loop at a time; toggle off by pressing same again */
+    uint8_t     pin;     /* GP number */
+} audio_track_t;
+
+/* Order matches your SD filenames; assign .pin when ready. */
+static const audio_track_t g_tracks[] = {
+    { "0:bulbasaur.wav",           false, 28 },
+    { "0:charmander.wav",          false, 27 },
+    { "0:healing.wav",             false, PIN_UNUSED },
+    { "0:level-up.wav",            false, PIN_UNUSED },
+    { "0:music-azalea-city.wav",   true,  14 },
+    { "0:music-poke-center.wav",   true,  PIN_UNUSED },
+    { "0:music-theme-fart.wav",    true,  PIN_UNUSED },
+    { "0:music-theme.wav",         true,  15 },
+    { "0:music-wild-battle.wav",   true,  PIN_UNUSED },
+    { "0:pikachu.wav",             false, PIN_UNUSED },
+    { "0:plink.wav",               false, PIN_UNUSED },
+    { "0:squirtle.wav",            false, PIN_UNUSED },
+};
+
+#define NUM_TRACKS ((int)(sizeof(g_tracks) / sizeof(g_tracks[0])))
+
+/* Core 0 → core 1: loop layer — at most one music-* file; 255 = none / silence. */
+static volatile uint8_t  active_loop_track = 255;
+static volatile bool     loop_playing      = false;
+
+/* One-shot SFX: increment trigger after setting sfx_track_id; any new press restarts that one-shot. */
+static volatile uint8_t  sfx_track_id   = 255;
+static volatile uint32_t sfx_trigger    = 0;
 
 /* ── DMA output buffer ───────────────────────────────────────────────────
    Each word: [left 16b | right 16b] (same mono sample on both channels).
@@ -43,7 +78,6 @@ static void __isr dma_irq_handler(void) {
         mix_ready[0] = false;
         if (!mix_ready[1]) {
             mix_underruns++;
-            printf("!");
         }
         dma_channel_configure(dma_a, &dc_a, (void *)txf, mix_buf[0], MIX_SAMPLES, false);
     }
@@ -52,7 +86,6 @@ static void __isr dma_irq_handler(void) {
         mix_ready[1] = false;
         if (!mix_ready[0]) {
             mix_underruns++;
-            printf("!");
         }
         dma_channel_configure(dma_b, &dc_b, (void *)txf, mix_buf[1], MIX_SAMPLES, false);
     }
@@ -125,6 +158,7 @@ static uint32_t wav_data_offset(FIL *f) {
 // }
 
 static int16_t music_raw[MIX_SAMPLES];
+static int16_t sfx_raw[MIX_SAMPLES];
 
 static void core1_entry(void) {
     printf("[c1] core1 started\n");
@@ -141,35 +175,103 @@ static void core1_entry(void) {
     printf("[c1] SD mounted\n");
     multicore_fifo_push_blocking(0xCAFE);
 
-    FIL      music_file;
-    uint32_t music_start = 0;
-    int      fill        = 0;
+    FIL      track_files[NUM_TRACKS];
+    uint32_t track_starts[NUM_TRACKS];
+    bool     track_ok[NUM_TRACKS];
 
-    if (f_open(&music_file, "0:pokemon-theme.wav", FA_READ) == FR_OK) {
-        music_start = wav_data_offset(&music_file);
-    } else {
-        printf("[c1] cannot open wav file\n");
-        for (;;) tight_loop_contents();
+    for (int t = 0; t < NUM_TRACKS; t++) {
+        track_ok[t] = false;
+        track_starts[t] = 0;
+        if (f_open(&track_files[t], g_tracks[t].path, FA_READ) == FR_OK) {
+            track_starts[t] = wav_data_offset(&track_files[t]);
+            track_ok[t] = true;
+        } else {
+            printf("[c1] cannot open %s\n", g_tracks[t].path);
+        }
     }
+
+    int      fill = 0;
+
+    bool     was_loop_playing = false;
+    uint8_t  last_loop_track  = 255;
+    bool     sfx_active       = false;
+    uint32_t last_sfx_trig    = 0;
 
     while (true) {
         if (mix_ready[fill]) { tight_loop_contents(); continue; }
 
-        UINT br = 0;
-        f_read(&music_file, music_raw, MIX_SAMPLES * sizeof(int16_t), &br);
-        int samples_read = (int)(br / sizeof(int16_t));
+        bool     lp = loop_playing;
+        uint8_t  lt = active_loop_track;
 
-        // printf("last: %d first: %d\n", music_raw[MIX_SAMPLES-1], music_raw[0]);
+        if (lp && (!was_loop_playing || lt != last_loop_track)) {
+            if (lt < (uint8_t)NUM_TRACKS && track_ok[lt] && g_tracks[lt].is_loop) {
+                f_lseek(&track_files[lt], track_starts[lt]);
+            }
+        }
+        was_loop_playing = lp;
+        last_loop_track  = lt;
 
-        if (samples_read < MIX_SAMPLES) {
-            memset(music_raw + samples_read, 0,
-                   (MIX_SAMPLES - samples_read) * sizeof(int16_t));
-            f_lseek(&music_file, music_start);
+        uint32_t trig = sfx_trigger;
+        if (trig != last_sfx_trig) {
+            last_sfx_trig = trig;
+            uint8_t sid = sfx_track_id;
+            if (sid < (uint8_t)NUM_TRACKS && track_ok[sid] && !g_tracks[sid].is_loop) {
+                f_lseek(&track_files[sid], track_starts[sid]);
+                sfx_active = true;
+            } else {
+                sfx_active = false;
+            }
         }
 
+        /* Layer 1: looped music (silence when off or missing file) */
+        if (lp && lt < (uint8_t)NUM_TRACKS && track_ok[lt] && g_tracks[lt].is_loop) {
+            UINT br = 0;
+            f_read(&track_files[lt], music_raw, MIX_SAMPLES * sizeof(int16_t), &br);
+            int samples_read = (int)(br / sizeof(int16_t));
+
+            if (samples_read < MIX_SAMPLES) {
+                memset(music_raw + samples_read, 0,
+                       (MIX_SAMPLES - samples_read) * sizeof(int16_t));
+                f_lseek(&track_files[lt], track_starts[lt]);
+            }
+        } else {
+            memset(music_raw, 0, MIX_SAMPLES * sizeof(int16_t));
+        }
+
+        /* Layer 2: one-shot SFX; a new trigger seeks to start and replaces the current one-shot */
+        if (sfx_active) {
+            UINT br    = 0;
+            uint8_t sid = sfx_track_id;
+            if (sid < (uint8_t)NUM_TRACKS && track_ok[sid] && !g_tracks[sid].is_loop) {
+                f_read(&track_files[sid], sfx_raw, MIX_SAMPLES * sizeof(int16_t), &br);
+            } else {
+                br = 0;
+            }
+            int samples_read = (int)(br / sizeof(int16_t));
+
+            if (br == 0) {
+                memset(sfx_raw, 0, MIX_SAMPLES * sizeof(int16_t));
+                sfx_active = false;
+            } else if (samples_read < MIX_SAMPLES) {
+                memset(sfx_raw + samples_read, 0,
+                       (MIX_SAMPLES - samples_read) * sizeof(int16_t));
+                sfx_active = false;
+            }
+        } else {
+            memset(sfx_raw, 0, MIX_SAMPLES * sizeof(int16_t));
+        }
+
+        /* Sum layers with clamp (allows loop + one-shots together) */
         for (int i = 0; i < MIX_SAMPLES; i++) {
-            uint16_t s = (uint16_t)music_raw[i];
-            mix_buf[fill][i] = ((uint32_t)s << 16) | s;
+            int32_t m = (int32_t)music_raw[i] + (int32_t)sfx_raw[i];
+            if (m > 32767) {
+                m = 32767;
+            }
+            if (m < -32768) {
+                m = -32768;
+            }
+            int16_t s = (int16_t)m;
+            mix_buf[fill][i] = ((uint32_t)(uint16_t)s << 16) | (uint16_t)s;
         }
 
         __dmb();
@@ -184,7 +286,6 @@ static void core1_entry(void) {
    Handles button, launches core1, and sets up PIO + DMA.                 */
 int main(void) {
     stdio_init_all();
-    while (!stdio_usb_connected()) sleep_ms(100);
     printf("Pokemon SD player starting...\n");
     
     /* Launch SD reader on core1, wait for mount confirmation */
@@ -240,9 +341,52 @@ int main(void) {
     // Kick off only A; B will auto-start via chain when A completes
     dma_channel_start(dma_a);
 
-    printf("Ready. Playing sound on loop.\n");
+    static bool prev_in[NUM_TRACKS];
+    static absolute_time_t last_press[NUM_TRACKS];
+
+    for (int i = 0; i < NUM_TRACKS; i++) {
+        prev_in[i] = false;
+        last_press[i] = get_absolute_time();
+        if (g_tracks[i].pin == PIN_UNUSED) {
+            continue;
+        }
+        gpio_init(g_tracks[i].pin);
+        gpio_set_dir(g_tracks[i].pin, GPIO_IN);
+        gpio_pull_up(g_tracks[i].pin);
+    }
+
+    printf("Ready. Set g_tracks[].pin for each GP (active low). PIN_UNUSED skips a row.\n");
 
     for (;;) {
+        for (int i = 0; i < NUM_TRACKS; i++) {
+            if (g_tracks[i].pin == PIN_UNUSED) {
+                continue;
+            }
+            uint8_t pin = g_tracks[i].pin;
+            bool in = !gpio_get(pin);
+            if (in && !prev_in[i]) {
+                absolute_time_t now = get_absolute_time();
+                if (absolute_time_diff_us(last_press[i], now) > 50000) {
+                    last_press[i] = now;
+                    if (g_tracks[i].is_loop) {
+                        if (loop_playing && active_loop_track == (uint8_t)i) {
+                            loop_playing = false;
+                            printf("\nloop stop: %s\n", g_tracks[i].path);
+                        } else {
+                            active_loop_track = (uint8_t)i;
+                            loop_playing = true;
+                            printf("\nloop start: %s\n", g_tracks[i].path);
+                        }
+                    } else {
+                        sfx_track_id = (uint8_t)i;
+                        sfx_trigger++;
+                        printf("\none-shot: %s\n", g_tracks[i].path);
+                    }
+                }
+            }
+            prev_in[i] = in;
+        }
+
         /* Log underruns once per second */
         static absolute_time_t next_log;
         if (time_reached(next_log)) {
