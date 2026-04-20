@@ -55,7 +55,7 @@ pico_enable_stdio_usb(pokemon-spi-sd 1)
 
 # Add the standard library to the build
 target_link_libraries(pokemon-spi-sd
-        pico_stdlib hardware_pio hardware_clocks hardware_spi hardware_dma hardware_irq pico_util pico_multicore no-OS-FatFS-SD-SDIO-SPI-RPi-Pico)
+        pico_stdlib hardware_pio hardware_clocks hardware_spi hardware_dma hardware_irq hardware_adc pico_util pico_multicore no-OS-FatFS-SD-SDIO-SPI-RPi-Pico)
 
 # Add the standard include files to the build
 target_include_directories(pokemon-spi-sd PRIVATE

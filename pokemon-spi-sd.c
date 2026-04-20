@@ -9,6 +9,7 @@
 #include "hardware/pio.h"
 #include "hardware/dma.h"
 #include "hardware/irq.h"
+#include "hardware/adc.h"
 #include "i2s_out.pio.h"
 #include "ff.h"
 #include "sd_card.h"
@@ -17,6 +18,8 @@
 /* ── Pins ──────────────────────────────────────────────────────────────── */
 #define DOUT_PIN         9    // MAX98357A DIN
 #define BCLK_PIN        10    // MAX98357A BCLK  (LRCLK = GP11, implicit as BCLK+1)
+
+#define DIAL_ADC_PIN    26    // ADC0 — pot wiper; ends to 3V3 / GND
 #define SAMPLE_RATE  48000
 
 /* Set GPIO per track (active low). Use PIN_UNUSED until wired. */
@@ -35,13 +38,13 @@ static const audio_track_t g_tracks[] = {
     { "0:healing.wav",             false, PIN_UNUSED },
     { "0:level-up.wav",            false, PIN_UNUSED },
     { "0:music-azalea-city.wav",   true,  14 },
-    { "0:music-poke-center.wav",   true,  PIN_UNUSED },
+    { "0:music-poke-center.wav",   true,  8 },
     { "0:music-theme-fart.wav",    true,  PIN_UNUSED },
     { "0:music-theme.wav",         true,  15 },
     { "0:music-wild-battle.wav",   true,  PIN_UNUSED },
     { "0:pikachu.wav",             false, PIN_UNUSED },
     { "0:plink.wav",               false, PIN_UNUSED },
-    { "0:squirtle.wav",            false, PIN_UNUSED },
+    { "0:squirtle.wav",            false, 21 },
 };
 
 #define NUM_TRACKS ((int)(sizeof(g_tracks) / sizeof(g_tracks[0])))
@@ -53,6 +56,31 @@ static volatile bool     loop_playing      = false;
 /* One-shot SFX: increment trigger after setting sfx_track_id; any new press restarts that one-shot. */
 static volatile uint8_t  sfx_track_id   = 255;
 static volatile uint32_t sfx_trigger    = 0;
+
+/* Master volume from dial (core 0 updates, core 1 reads). Q16.16: 65536 = unity gain. */
+static volatile uint32_t master_gain_q16;
+static uint32_t dial_gain_smooth;
+
+/* Wide dead band at ADC rails: at max, noise often dips tens–hundreds of counts below
+ * a tiny 64-LSB plateau, which maps into the linear region and makes gain hunt. */
+#define DIAL_ADC_LO_TH   256u   /* below: mute */
+#define DIAL_ADC_HI_TH   3840u  /* at or above: unity (4096 − 256) */
+
+/* USB dial log: only when applied master gain (Q16) moves by at least this much.
+ * 1024 ≈ 1.6 % linear (~0.13 dB at unity); increase if logs are too chatty. */
+#define DIAL_LOG_GAIN_MIN_DELTA 1024u
+
+static uint32_t dial_adc_to_gain_q16(uint16_t adc) {
+    if (adc < DIAL_ADC_LO_TH) {
+        return 0u;
+    }
+    if (adc >= DIAL_ADC_HI_TH) {
+        return 65536u;
+    }
+    uint32_t x = (uint32_t)adc - DIAL_ADC_LO_TH;
+    uint32_t span = (DIAL_ADC_HI_TH - 1u) - DIAL_ADC_LO_TH; /* last linear code before unity */
+    return (x * 65536u) / span;
+}
 
 /* ── DMA output buffer ───────────────────────────────────────────────────
    Each word: [left 16b | right 16b] (same mono sample on both channels).
@@ -104,58 +132,6 @@ static uint32_t wav_data_offset(FIL *f) {
     }
     return 44;
 }
-
-
-// Plays four tones back to back: 
-// 1. Low frequency, low volume
-// 2. High frequency, high volume
-// 3. Low frequency, high volume
-// 4. High frequency, low volume
-// static void core1_entry(void) {
-//     // Signal core0 that we're ready (replaces the SD mount signal)
-//     multicore_fifo_push_blocking(0xCAFE);
-
-//     int fill = 0;
-
-//     // Define tone test cases: {frequency [Hz], amplitude}
-//     struct {
-//         float freq;
-//         float amplitude;
-//         const char *desc;
-//     } tones[] = {
-//         { 200.0f,   1000.0f,  "Low freq, low vol" },   // Test 1
-//         { 4000.0f, 30000.0f,  "High freq, high vol" }, // Test 2
-//         { 200.0f,  30000.0f,  "Low freq, high vol" },  // Test 3
-//         { 4000.0f,  1000.0f,  "High freq, low vol" },  // Test 4
-//     };
-
-//     const int num_tones = sizeof(tones) / sizeof(tones[0]);
-//     const float two_pi = 2.0f * 3.14159265f;
-//     const int tone_samples = SAMPLE_RATE * 2; // 2 seconds of each tone
-
-//     while (true) {
-//         for (int t = 0; t < num_tones; t++) {
-//             float phase = 0.0f;
-//             float phase_inc = two_pi * tones[t].freq / (float)SAMPLE_RATE;
-
-//             int played = 0;
-//             while (played < tone_samples) {
-//                 if (mix_ready[fill]) { tight_loop_contents(); continue; }
-
-//                 for (int i = 0; i < MIX_SAMPLES && played < tone_samples; i++, played++) {
-//                     int16_t s = (int16_t)(sinf(phase) * tones[t].amplitude);
-//                     mix_buf[fill][i] = ((uint32_t)(uint16_t)s << 16) | (uint16_t)s;
-//                     phase += phase_inc;
-//                     if (phase >= two_pi) phase -= two_pi;
-//                 }
-
-//                 __dmb();
-//                 mix_ready[fill] = true;
-//                 fill ^= 1;
-//             }
-//         }
-//     }
-// }
 
 static int16_t music_raw[MIX_SAMPLES];
 static int16_t sfx_raw[MIX_SAMPLES];
@@ -261,9 +237,11 @@ static void core1_entry(void) {
             memset(sfx_raw, 0, MIX_SAMPLES * sizeof(int16_t));
         }
 
-        /* Sum layers with clamp (allows loop + one-shots together) */
+        /* Sum layers, apply master gain (Q16), clamp (allows loop + one-shots together). */
+        uint32_t g = master_gain_q16;
         for (int i = 0; i < MIX_SAMPLES; i++) {
-            int32_t m = (int32_t)music_raw[i] + (int32_t)sfx_raw[i];
+            int64_t m = (int64_t)music_raw[i] + (int64_t)sfx_raw[i];
+            m = (m * (int64_t)g) >> 16;
             if (m > 32767) {
                 m = 32767;
             }
@@ -286,8 +264,27 @@ static void core1_entry(void) {
    Handles button, launches core1, and sets up PIO + DMA.                 */
 int main(void) {
     stdio_init_all();
+    while (!stdio_usb_connected()) sleep_ms(100);
     printf("Pokemon SD player starting...\n");
-    
+
+    /* ADC + dial gain before core1 mixes: avoids one buffer at wrong volume. */
+    adc_init();
+    adc_gpio_init(DIAL_ADC_PIN);
+    adc_select_input(0); /* GPIO26 = ADC0 */
+    for (int w = 0; w < 8; w++) {
+        (void)adc_read();
+    }
+    {
+        uint32_t acc = 0;
+        for (int s = 0; s < 4; s++) {
+            acc += adc_read();
+        }
+        uint16_t adc0 = (uint16_t)((acc + 2u) / 4u);
+        uint32_t t = dial_adc_to_gain_q16(adc0);
+        dial_gain_smooth = t;
+        master_gain_q16   = t;
+    }
+
     /* Launch SD reader on core1, wait for mount confirmation */
     multicore_launch_core1(core1_entry);
     uint32_t sig = multicore_fifo_pop_blocking();
@@ -356,6 +353,7 @@ int main(void) {
     }
 
     printf("Ready. Set g_tracks[].pin for each GP (active low). PIN_UNUSED skips a row.\n");
+    printf("Dial GP%u: master volume (USB logs when the knob moves).\n", DIAL_ADC_PIN);
 
     for (;;) {
         for (int i = 0; i < NUM_TRACKS; i++) {
@@ -387,6 +385,42 @@ int main(void) {
             prev_in[i] = in;
         }
 
+        /* Dial: 4× average; dial_adc_to_gain_q16(); EMA (~⅛ per 20 ms) updates master_gain_q16. */
+        static uint32_t last_dial_ms;
+        static uint32_t last_logged_gain_q16 = UINT32_MAX;
+
+        uint32_t ms = to_ms_since_boot(get_absolute_time());
+        if (ms - last_dial_ms >= 20u) {
+            last_dial_ms = ms;
+
+            uint32_t acc = 0;
+            for (int s = 0; s < 4; s++) {
+                acc += adc_read();
+            }
+            uint16_t adc = (uint16_t)((acc + 2u) / 4u);
+
+            uint32_t target_q16 = dial_adc_to_gain_q16(adc);
+            {
+                int32_t err = (int32_t)target_q16 - (int32_t)dial_gain_smooth;
+                dial_gain_smooth += (uint32_t)(err >> 3); /* ~⅛ toward target per poll */
+            }
+            master_gain_q16 = dial_gain_smooth;
+
+            uint32_t g = dial_gain_smooth;
+            if (last_logged_gain_q16 == UINT32_MAX) {
+                printf("dial: adc %4u  gain %u/65536 (initial)\n", adc, g);
+                last_logged_gain_q16 = g;
+            } else {
+                int32_t dg = (int32_t)g - (int32_t)last_logged_gain_q16;
+                uint32_t adg = (uint32_t)(dg < 0 ? -dg : dg);
+                if (adg >= DIAL_LOG_GAIN_MIN_DELTA) {
+                    printf("dial: adc %4u  gain %u/65536  (gain Δ %+ld)\n",
+                           adc, g, (long)dg);
+                    last_logged_gain_q16 = g;
+                }
+            }
+        }
+
         /* Log underruns once per second */
         static absolute_time_t next_log;
         if (time_reached(next_log)) {
@@ -398,64 +432,3 @@ int main(void) {
         }
     }
 }
-
-
-// #include <stdio.h>
-// #include "pico/stdlib.h"
-// #include "pico/stdio_usb.h"
-// #include "f_util.h"
-// #include "ff.h"
-// #include "hw_config.h"
-
-// int main(void) {
-//     stdio_init_all();
-//     while (!stdio_usb_connected()) sleep_ms(100);
-//     printf("SD card test starting...\n");
-
-//     sleep_ms(3000);
-//     FATFS fs;
-//     FRESULT fr = f_mount(&fs, "", 1);
-//     if (fr != FR_OK) {
-//         printf("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
-//         // printf("No filesystem found, formatting...\n");
-    
-//         // BYTE work[FF_MAX_SS];  // work buffer (512 bytes typically)
-//         // fr = f_mkfs("", NULL, work, sizeof(work));  // NULL opts = default FAT
-//         // if (fr != FR_OK) {
-//         //     printf("f_mkfs error: %s (%d)\n", FRESULT_str(fr), fr);
-//         //     for (;;) tight_loop_contents();
-//         // }
-//         // printf("Formatted successfully, remounting...\n");
-//         // fr = f_mount(&fs, "", 1);
-
-//         for (;;) tight_loop_contents();
-//     }
-//     printf("SD card mounted successfully!\n");
-
-//     // Print card size
-//     FATFS *fsp;
-//     DWORD free_clusters;
-//     fr = f_getfree("", &free_clusters, &fsp);
-//     if (fr == FR_OK) {
-//         DWORD total_sectors = (fsp->n_fatent - 2) * fsp->csize;
-//         DWORD free_sectors  = free_clusters * fsp->csize;
-//         printf("Total: %lu MB\n", total_sectors / 2 / 1024);
-//         printf("Free:  %lu MB\n", free_sectors  / 2 / 1024);
-//     }
-
-//     // Write a test file
-//     FIL fil;
-//     fr = f_open(&fil, "test.txt", FA_CREATE_ALWAYS | FA_WRITE);
-//     if (fr == FR_OK) {
-//         f_printf(&fil, "Hello from Pico!\n");
-//         f_close(&fil);
-//         printf("Wrote test.txt\n");
-//     } else {
-//         printf("f_open error: %s (%d)\n", FRESULT_str(fr), fr);
-//     }
-
-//     f_unmount("");
-//     printf("Done.\n");
-
-//     for (;;) tight_loop_contents();
-// }
