@@ -28,7 +28,7 @@ set(PICO_BOARD pico CACHE STRING "Board type")
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
-project(pokemon-spi-sd C CXX ASM)
+project(pokemon C CXX ASM)
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
@@ -42,27 +42,27 @@ FetchContent_Declare(no-OS-FatFS-SD-SDIO-SPI-RPi-Pico
 )
 FetchContent_MakeAvailable(no-OS-FatFS-SD-SDIO-SPI-RPi-Pico)
 
-add_executable(pokemon-spi-sd pokemon-spi-sd.c hw_config.c)
+add_executable(pokemon main.c hw_config.c)
 
-pico_generate_pio_header(pokemon-spi-sd ${CMAKE_CURRENT_LIST_DIR}/i2s_out.pio)
+pico_generate_pio_header(pokemon ${CMAKE_CURRENT_LIST_DIR}/i2s_out.pio)
 
-pico_set_program_name(pokemon-spi-sd "pokemon-spi-sd")
-pico_set_program_version(pokemon-spi-sd "0.1")
+pico_set_program_name(pokemon "pokemon")
+pico_set_program_version(pokemon "0.1")
 
 # Modify the below lines to enable/disable output over UART/USB
-pico_enable_stdio_uart(pokemon-spi-sd 0)
-pico_enable_stdio_usb(pokemon-spi-sd 1)
+pico_enable_stdio_uart(pokemon 0)
+pico_enable_stdio_usb(pokemon 1)
 
 # Add the standard library to the build
-target_link_libraries(pokemon-spi-sd
+target_link_libraries(pokemon
         pico_stdlib hardware_pio hardware_clocks hardware_spi hardware_dma hardware_irq hardware_adc pico_util pico_multicore no-OS-FatFS-SD-SDIO-SPI-RPi-Pico)
 
 # Add the standard include files to the build
-target_include_directories(pokemon-spi-sd PRIVATE
+target_include_directories(pokemon PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
         ${no-os-fatfs-sd-spi-rpi-pico_SOURCE_DIR}/src
         ${no-os-fatfs-sd-spi-rpi-pico_SOURCE_DIR}/FatFs_SPI/sd_driver
 )
 
-pico_add_extra_outputs(pokemon-spi-sd)
+pico_add_extra_outputs(pokemon)
 
