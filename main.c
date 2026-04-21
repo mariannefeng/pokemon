@@ -10,6 +10,8 @@
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "hardware/adc.h"
+#include "pico/bootrom.h"
+#include "tusb.h"
 #include "i2s_out.pio.h"
 #include "ff.h"
 #include "sd_card.h"
@@ -25,6 +27,8 @@
 
 /* Set GPIO per track (active low). Use PIN_UNUSED until wired. */
 #define PIN_UNUSED 255
+
+bool letsReset = false;
 
 typedef struct {
     const char *path;   /* FatFs path under mount "0:" */
@@ -145,6 +149,17 @@ static uint32_t wav_data_offset(FIL *f) {
 
 static int16_t music_raw[MIX_SAMPLES];
 static int16_t sfx_raw[MIX_SAMPLES];
+
+// when we get r over USB, reset
+void tud_cdc_rx_cb(uint8_t itf) {
+    (void)itf;
+    while (tud_cdc_available()) {
+        char c = tud_cdc_read_char();
+        if (c == 'r') {
+            letsReset = true;
+        }
+    }
+}
 
 // core1_entry does everything related to audio in a tight loop like reading wav files from SD card, mixing active sounds, and filling the audio buffer. 
 static void core1_entry(void) {
@@ -292,7 +307,10 @@ static void core1_entry(void) {
    Handles button, launches core1, and sets up PIO + DMA.                 */
 int main(void) {
     stdio_init_all();
-    while (!stdio_usb_connected()) sleep_ms(100);
+    tusb_init();
+    // while (!stdio_usb_connected()) sleep_ms(100);
+
+
 
     printf("Pokemon SD player starting...\n");
 
@@ -390,6 +408,12 @@ int main(void) {
     printf("Dial GP%u: master volume (USB logs when the knob moves).\n", DIAL_ADC_PIN);
 
     while (true) {
+        tud_task();
+
+        if (letsReset) {
+            reset_usb_boot(0, 0);
+        }
+
         for (int i = 0; i < NUM_TRACKS; i++) {
             if (tracks[i].pin == PIN_UNUSED) {
                 continue;
