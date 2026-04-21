@@ -27,37 +27,54 @@
 
 #define SAMPLE_RATE  48000
 
-/* Set GPIO per track (active low). Use PIN_UNUSED until wired. */
+/* Active-low buttons, internal pull-up. */
 #define PIN_UNUSED 255
+
+#define SHIFT_PIN         4
+#define NUM_SFX_BUTTONS   4
+#define NUM_MUSIC_BUTTONS 3
 
 bool letsReset = false;
 
 typedef struct {
     const char *path;   /* FatFs path under mount "0:" */
-    bool        is_loop; /* true: music-* style — one loop at a time; toggle off by pressing same again */
-    uint8_t     pin;     /* GP number */
+    bool        is_loop; /* true: music — one loop at a time; toggle off by pressing same again */
 } audio_track_t;
 
+/* Track order: 0..7 = one-shot SFX, 8..13 = looped music. Button→track mapping is below. */
 static const audio_track_t tracks[] = {
-    { "0:bulbasaur.wav",           false, 13 },
-    { "0:charmander.wav",          false, 20 },
-    { "0:healing.wav",             false, PIN_UNUSED },
-    { "0:level-up.wav",            false, PIN_UNUSED },
-    { "0:pikachu.wav",             false, PIN_UNUSED },
-    { "0:plink.wav",               false, PIN_UNUSED },
-    { "0:squirtle.wav",            false, 21 },
-    { "0:gb-on.wav",               false, PIN_UNUSED },
+    { "0:bulbasaur.wav",           false },
+    { "0:charmander.wav",          false },
+    { "0:pikachu.wav",             false },
+    { "0:squirtle.wav",            false },
+    { "0:healing.wav",             false },
+    { "0:level-up.wav",            false },
+    { "0:plink.wav",               false },
+    { "0:gameboy-on.wav",               false },
 
-    { "0:music-theme.wav",         true,  15 },
-    { "0:music-theme-fart.wav",    true,  PIN_UNUSED },
-    { "0:music-poke-center.wav",   true,  8 },
-    { "0:music-wild-battle.wav",   true,  PIN_UNUSED },
-    { "0:music-azalea-city.wav",   true,  14 },
-    { "0:music-ecruteak-city.wav",   true,  14 },
-    { "0:music-violet-city.wav",   true,  14 },
+    { "0:music-theme.wav",         true },
+    { "0:music-poke-center.wav",   true },
+    { "0:music-wild-battle.wav",   true },
+    { "0:music-violet-city.wav",    true },
+    { "0:music-azalea-city.wav",   true },
+    { "0:music-ecruteak-city.wav", true },
 };
 
 #define NUM_TRACKS ((int)(sizeof(tracks) / sizeof(*tracks)))
+
+/* GP for each SFX / music key (unshifted & shifted use same GPIO; hold GP4 / SHIFT). */
+static const uint8_t sfx_button_pin[NUM_SFX_BUTTONS]   = { 13, 20, 12, 21 };
+static const uint8_t music_button_pin[NUM_MUSIC_BUTTONS] = { 15, 8, 14 };
+
+/* Row 0 = unshifted, row 1 = with shift held. */
+static const uint8_t sfx_track_id[2][NUM_SFX_BUTTONS] = {
+    { 0, 1, 2, 3 },
+    { 4, 5, 6, 7 },
+};
+static const uint8_t music_track_id[2][NUM_MUSIC_BUTTONS] = {
+    { 8,  9,  10 },
+    { 11, 12, 13 },
+};
 
 // TODO: refactor these fucken names they're bad and confuses me
 
@@ -293,7 +310,7 @@ static uint32_t wav_data_offset(FIL *f) {
 static int16_t music_raw[MIX_SAMPLES];
 static int16_t music_in[(MIX_SAMPLES * 2) + 4];
 
-#define SFX_VOICES 2
+#define SFX_VOICES 3
 typedef struct {
     bool     active;
     uint8_t  track_id;
@@ -386,6 +403,7 @@ static void core1_entry(void) {
 
         // Drain SFX queue: start/steal a voice for each event.
         uint8_t ev_id = 255;
+        static uint32_t sfx_steal_rr = 0;
         while (sfx_q_pop(&ev_id)) {
             if (ev_id >= (uint8_t)NUM_TRACKS) continue;
             if (!track_ok[ev_id]) continue;
@@ -396,8 +414,9 @@ static void core1_entry(void) {
                 if (!voices[v].active) { chosen = v; break; }
             }
             if (chosen < 0) {
-                // All voices busy: steal voice 0 (simple, deterministic).
-                chosen = 0;
+                // All voices busy: steal a voice round-robin.
+                chosen = (int)(sfx_steal_rr % (uint32_t)SFX_VOICES);
+                sfx_steal_rr++;
             }
             voices[chosen].track_id = ev_id;
             voices[chosen].active = true;
@@ -664,55 +683,104 @@ int main(void) {
     // Kick off only A; B will auto-start via chain when A completes
     dma_channel_start(dma_a);
 
-    static bool prev_in[NUM_TRACKS];
-    static absolute_time_t last_press[NUM_TRACKS];
+    static bool prev_sfx_in[NUM_SFX_BUTTONS];
+    static bool prev_music_in[NUM_MUSIC_BUTTONS];
+    static absolute_time_t last_press_sfx[NUM_SFX_BUTTONS];
+    static absolute_time_t last_press_music[NUM_MUSIC_BUTTONS];
 
-    for (int i = 0; i < NUM_TRACKS; i++) {
-        prev_in[i] = false;
-        last_press[i] = get_absolute_time();
-        if (tracks[i].pin == PIN_UNUSED) {
-            continue;
-        }
-        gpio_init(tracks[i].pin);
-        gpio_set_dir(tracks[i].pin, GPIO_IN);
-        gpio_pull_up(tracks[i].pin);
+    gpio_init(SHIFT_PIN);
+    gpio_set_dir(SHIFT_PIN, GPIO_IN);
+    gpio_pull_up(SHIFT_PIN);
+
+    for (int s = 0; s < NUM_SFX_BUTTONS; s++) {
+        prev_sfx_in[s] = false;
+        last_press_sfx[s] = get_absolute_time();
+        uint8_t p = sfx_button_pin[s];
+        gpio_init(p);
+        gpio_set_dir(p, GPIO_IN);
+        gpio_pull_up(p);
+    }
+    for (int m = 0; m < NUM_MUSIC_BUTTONS; m++) {
+        prev_music_in[m] = false;
+        last_press_music[m] = get_absolute_time();
+        uint8_t p = music_button_pin[m];
+        gpio_init(p);
+        gpio_set_dir(p, GPIO_IN);
+        gpio_pull_up(p);
     }
 
-    printf("Ready. Set tracks[].pin for each GP (active low). PIN_UNUSED skips a row.\n");
+    printf("Ready. GP%u=shift, %u SFX + %u music (active low).\n",
+           SHIFT_PIN, NUM_SFX_BUTTONS, NUM_MUSIC_BUTTONS);
     printf("Dial GP%u: master volume (USB logs when the knob moves).\n", VOLUME_PIN);
     printf("Speed pot GP%u: music speed 0.5x..1.5x (snaps to 1.0x).\n", SPEED_PIN);
     printf("Vibrato pot GP%u: SFX vibrato depth (0 = off).\n", VIBRATO_PIN);
-
-    // Record button placeholder (active low). Keep PIN_UNUSED until wired.
-    // When not wired, record/playback feature is inert.
-    #define RECORD_PIN 0
-    bool record_prev_in = false;
-
-    if (RECORD_PIN != PIN_UNUSED) {
-        gpio_init(RECORD_PIN);
-        gpio_set_dir(RECORD_PIN, GPIO_IN);
-        gpio_pull_up(RECORD_PIN);
-    }
 
     typedef struct {
         uint32_t delta_ms;
         uint8_t  track_id;
     } record_ev_t;
 
-    #define RECORD_MAX_EVENTS 96u
-    static record_ev_t record_events[RECORD_MAX_EVENTS];
-    uint32_t record_event_count = 0;
-
     typedef enum { REC_IDLE = 0, REC_RECORDING = 1, REC_PLAYING = 2 } rec_state_t;
-    rec_state_t rec_state = REC_IDLE;
-    uint32_t record_start_ms = 0;
-    uint32_t record_last_ev_ms = 0;
-    uint32_t snippet_len_ms = 0;
 
-    // Playback scheduler state
-    uint32_t playback_cycle_start_ms = 0;
-    uint32_t playback_idx = 0;
-    uint32_t playback_next_due_ms = 0;
+    #define RECORD_MAX_EVENTS 96u
+
+    typedef struct {
+        uint8_t pin;
+        uint8_t led_pin;
+
+        bool record_prev_in;
+        rec_state_t state;
+
+        record_ev_t events[RECORD_MAX_EVENTS];
+        uint32_t event_count;
+
+        uint32_t record_start_ms;
+        uint32_t record_last_ev_ms;
+        uint32_t snippet_len_ms;
+
+        // Playback scheduler state
+        uint32_t playback_cycle_start_ms;
+        uint32_t playback_idx;
+        uint32_t playback_next_due_ms;
+    } recorder_t;
+
+    static recorder_t rec_a = {
+        .pin = 0,      // GP0 record button
+        .led_pin = 1,  // GP1 LED
+    };
+
+    static recorder_t rec_b = {
+        .pin = 2,      // GP2 record button
+        .led_pin = 3,  // GP3 LED
+    };
+
+    recorder_t *recorders[] = { &rec_a, &rec_b };
+    const uint32_t recorder_count = (uint32_t)(sizeof(recorders) / sizeof(recorders[0]));
+
+    for (uint32_t ri = 0; ri < recorder_count; ri++) {
+        recorder_t *r = recorders[ri];
+        r->record_prev_in = false;
+        r->state = REC_IDLE;
+        r->event_count = 0;
+        r->record_start_ms = 0;
+        r->record_last_ev_ms = 0;
+        r->snippet_len_ms = 0;
+        r->playback_cycle_start_ms = 0;
+        r->playback_idx = 0;
+        r->playback_next_due_ms = 0;
+
+        if (r->pin != PIN_UNUSED) {
+            gpio_init(r->pin);
+            gpio_set_dir(r->pin, GPIO_IN);
+            gpio_pull_up(r->pin);
+        }
+
+        if (r->led_pin != PIN_UNUSED) {
+            gpio_init(r->led_pin);
+            gpio_set_dir(r->led_pin, GPIO_OUT);
+            gpio_put(r->led_pin, 0);
+        }
+    }
 
     while (true) {
         tud_task();
@@ -721,103 +789,126 @@ int main(void) {
             reset_usb_boot(0, 0);
         }
 
-        // Record button state machine (if wired).
-        if (RECORD_PIN != PIN_UNUSED) {
-            bool record_in = !gpio_get(RECORD_PIN);
-            uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        // Record button(s) + playback tick (two independent recorders).
+        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        for (uint32_t ri = 0; ri < recorder_count; ri++) {
+            recorder_t *r = recorders[ri];
+            if (r->pin == PIN_UNUSED) continue;
+
+            bool record_in = !gpio_get(r->pin);
+
+            // LED behavior:
+            // - While holding record: solid ON
+            // - While recorded loop is playing: pulse continuously
+            // - Otherwise: OFF
+            if (r->led_pin != PIN_UNUSED) {
+                bool led_on = false;
+                if (record_in) {
+                    led_on = true;
+                } else if (r->state == REC_PLAYING) {
+                    // 1 Hz pulse (500ms on, 500ms off)
+                    led_on = ((now_ms / 500u) & 1u) != 0u;
+                }
+                gpio_put(r->led_pin, led_on ? 1 : 0);
+            }
 
             // Down edge
-            if (record_in && !record_prev_in) {
-                if (rec_state == REC_PLAYING) {
-                    rec_state = REC_IDLE;
+            if (record_in && !r->record_prev_in) {
+                if (r->state == REC_PLAYING) {
+                    r->state = REC_IDLE;
                 } else {
-                    // start recording
-                    rec_state = REC_RECORDING;
-                    record_event_count = 0;
-                    record_start_ms = now_ms;
-                    record_last_ev_ms = now_ms;
-                    snippet_len_ms = 0;
+                    r->state = REC_RECORDING;
+                    r->event_count = 0;
+                    r->record_start_ms = now_ms;
+                    r->record_last_ev_ms = now_ms;
+                    r->snippet_len_ms = 0;
                 }
             }
 
             // Up edge
-            if (!record_in && record_prev_in) {
-                if (rec_state == REC_RECORDING) {
-                    if (record_event_count == 0) {
-                        rec_state = REC_IDLE;
+            if (!record_in && r->record_prev_in) {
+                if (r->state == REC_RECORDING) {
+                    if (r->event_count == 0) {
+                        r->state = REC_IDLE;
                     } else {
-                        snippet_len_ms = now_ms - record_start_ms;
-                        if (snippet_len_ms < 1u) snippet_len_ms = 1u;
-                        rec_state = REC_PLAYING;
-                        playback_cycle_start_ms = now_ms;
-                        playback_idx = 0;
-                        playback_next_due_ms = record_events[0].delta_ms;
+                        r->snippet_len_ms = now_ms - r->record_start_ms;
+                        if (r->snippet_len_ms < 1u) r->snippet_len_ms = 1u;
+                        r->state = REC_PLAYING;
+                        r->playback_cycle_start_ms = now_ms;
+                        r->playback_idx = 0;
+                        r->playback_next_due_ms = r->events[0].delta_ms;
                     }
                 }
             }
 
-            record_prev_in = record_in;
+            r->record_prev_in = record_in;
 
             // Playback tick
-            if (rec_state == REC_PLAYING && record_event_count > 0) {
-                uint32_t elapsed = now_ms - playback_cycle_start_ms;
+            if (r->state == REC_PLAYING && r->event_count > 0) {
+                uint32_t elapsed = now_ms - r->playback_cycle_start_ms;
 
-                while (playback_idx < record_event_count && elapsed >= playback_next_due_ms) {
-                    (void)sfx_q_push(record_events[playback_idx].track_id);
-                    playback_idx++;
-                    if (playback_idx < record_event_count) {
-                        playback_next_due_ms += record_events[playback_idx].delta_ms;
+                while (r->playback_idx < r->event_count && elapsed >= r->playback_next_due_ms) {
+                    (void)sfx_q_push(r->events[r->playback_idx].track_id);
+                    r->playback_idx++;
+                    if (r->playback_idx < r->event_count) {
+                        r->playback_next_due_ms += r->events[r->playback_idx].delta_ms;
                     }
                 }
 
-                if (elapsed >= snippet_len_ms) {
-                    // new cycle; advance by snippet length to reduce drift
-                    playback_cycle_start_ms += snippet_len_ms;
-                    playback_idx = 0;
-                    playback_next_due_ms = record_events[0].delta_ms;
+                if (elapsed >= r->snippet_len_ms) {
+                    r->playback_cycle_start_ms += r->snippet_len_ms;
+                    r->playback_idx = 0;
+                    r->playback_next_due_ms = r->events[0].delta_ms;
                 }
             }
         }
 
-        for (int i = 0; i < NUM_TRACKS; i++) {
-            if (tracks[i].pin == PIN_UNUSED) {
-                continue;
-            }
-            uint8_t pin = tracks[i].pin;
-            bool in = !gpio_get(pin);
-            if (in && !prev_in[i]) {
+        for (int m = 0; m < NUM_MUSIC_BUTTONS; m++) {
+            bool in = !gpio_get(music_button_pin[m]);
+            if (in && !prev_music_in[m]) {
                 absolute_time_t now = get_absolute_time();
-                // debounce - ignore presses within 50ms of prev click
-                if (absolute_time_diff_us(last_press[i], now) > 50000) {
-                    last_press[i] = now;
-                    if (tracks[i].is_loop) {
-                        if (loop_playing && active_loop_track == (uint8_t)i) {
-                            loop_playing = false;
-                            printf("\nloop stop: %s\n", tracks[i].path);
-                        } else {
-                            active_loop_track = (uint8_t)i;
-                            loop_playing = true;
-                            printf("\nloop start: %s\n", tracks[i].path);
-                        }
+                if (absolute_time_diff_us(last_press_music[m], now) > 50000) {
+                    last_press_music[m] = now;
+                    uint8_t r = !gpio_get(SHIFT_PIN) ? 1u : 0u;
+                    uint8_t tid = music_track_id[r][m];
+                    if (loop_playing && active_loop_track == tid) {
+                        loop_playing = false;
+                        printf("\nloop stop: %s\n", tracks[tid].path);
                     } else {
-                        (void)sfx_q_push((uint8_t)i);
-                        printf("\none-shot: %s\n", tracks[i].path);
-
-                        // If recording, capture timing + track id (SFX only).
-                        if (RECORD_PIN != PIN_UNUSED && rec_state == REC_RECORDING) {
-                            uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-                            if (record_event_count < RECORD_MAX_EVENTS) {
-                                uint32_t d = now_ms - record_last_ev_ms;
-                                record_last_ev_ms = now_ms;
-                                record_events[record_event_count].delta_ms = d;
-                                record_events[record_event_count].track_id = (uint8_t)i;
-                                record_event_count++;
-                            }
-                        }
+                        active_loop_track = tid;
+                        loop_playing = true;
+                        printf("\nloop start: %s\n", tracks[tid].path);
                     }
                 }
             }
-            prev_in[i] = in;
+            prev_music_in[m] = in;
+        }
+
+        for (int s = 0; s < NUM_SFX_BUTTONS; s++) {
+            bool in = !gpio_get(sfx_button_pin[s]);
+            if (in && !prev_sfx_in[s]) {
+                absolute_time_t now = get_absolute_time();
+                if (absolute_time_diff_us(last_press_sfx[s], now) > 50000) {
+                    last_press_sfx[s] = now;
+                    uint8_t r = !gpio_get(SHIFT_PIN) ? 1u : 0u;
+                    uint8_t tid = sfx_track_id[r][s];
+                    (void)sfx_q_push(tid);
+                    printf("\none-shot: %s\n", tracks[tid].path);
+
+                    for (uint32_t ri = 0; ri < recorder_count; ri++) {
+                        recorder_t *r = recorders[ri];
+                        if (r->state != REC_RECORDING) continue;
+                        if (r->event_count >= RECORD_MAX_EVENTS) continue;
+                        uint32_t now2_ms = to_ms_since_boot(get_absolute_time());
+                        uint32_t d = now2_ms - r->record_last_ev_ms;
+                        r->record_last_ev_ms = now2_ms;
+                        r->events[r->event_count].delta_ms = d;
+                        r->events[r->event_count].track_id = tid;
+                        r->event_count++;
+                    }
+                }
+            }
+            prev_sfx_in[s] = in;
         }
 
         /* Dials: 4× average each; EMA (~⅛ per 20 ms) updates master_gain_q16 and music_speed_q16. */
