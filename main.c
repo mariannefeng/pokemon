@@ -34,6 +34,8 @@
 #define NUM_SFX_BUTTONS   4
 #define NUM_MUSIC_BUTTONS 3
 
+#define SHIFT_LED_PIN 5
+
 bool letsReset = false;
 
 typedef struct {
@@ -41,23 +43,28 @@ typedef struct {
     bool        is_loop; /* true: music — one loop at a time; toggle off by pressing same again */
 } audio_track_t;
 
+// todo: add fart song // NEED TO UPDATE SD CARD + THINK ABOUT HOW TO TRIGGER
+// other secret song choices:
+    // magnetic by ILLIT
+    // gameboy by katseye
+
 /* Track order: 0..7 = one-shot SFX, 8..13 = looped music. Button→track mapping is below. */
 static const audio_track_t tracks[] = {
-    { "0:bulbasaur.wav",           false },
-    { "0:charmander.wav",          false },
-    { "0:pikachu.wav",             false },
-    { "0:squirtle.wav",            false },
-    { "0:healing.wav",             false },
-    { "0:level-up.wav",            false },
-    { "0:plink.wav",               false },
-    { "0:gameboy-on.wav",               false },
+    { "0:bulbasaur.wav",           false }, // fine
+    { "0:charmander.wav",          false }, // fine
+    { "0:pikachu.wav",             false }, // fine
+    { "0:squirtle.wav",            false }, // NEED TO UPDATE SD CARD
+    { "0:healing.wav",             false }, // NEED TO UPDATE SD CARD
+    { "0:level-up.wav",            false }, // NEED TO UPDATE SD CARD
+    { "0:plink.wav",               false }, // NEED TO UPDATE SD CARD
+    { "0:gameboy-on.wav",          false }, // NEED TO UPDATE SD CARD
 
-    { "0:music-theme.wav",         true },
-    { "0:music-poke-center.wav",   true },
-    { "0:music-wild-battle.wav",   true },
-    { "0:music-violet-city.wav",    true },
-    { "0:music-azalea-city.wav",   true },
-    { "0:music-ecruteak-city.wav", true },
+    { "0:music-theme.wav",         true }, // loops from beginning, sounds fine as-is with lil silence after the PO-KE-MON! part
+    { "0:music-poke-center.wav",   true }, // NEED TO UPDATE SD CARD - loops from beginning
+    { "0:music-wild-battle.wav",   true }, // NEED TO UPDATE SD CARD - loops from 644335 sample (need to *2)
+    { "0:music-violet-city.wav",   true }, // NEED TO UPDATE SD CARD - loops from 481096 sample (need to *2)
+    { "0:music-azalea-city.wav",   true }, // loops not from beginning - updated
+    { "0:music-ecruteak-city.wav", true }, // NEED TO UPDATE SD CARD - loops from beginning
 };
 
 #define NUM_TRACKS ((int)(sizeof(tracks) / sizeof(*tracks)))
@@ -352,6 +359,7 @@ static void core1_entry(void) {
 
     // tracks starting byte offset for wav files
     uint32_t track_starts[NUM_TRACKS]; 
+    uint32_t track_loop_start[NUM_TRACKS]; 
 
     // tracks whether or not we could open the file
     bool     track_ok[NUM_TRACKS];
@@ -361,9 +369,16 @@ static void core1_entry(void) {
         track_ok[t] = false;
         if (f_open(&track_files[t], tracks[t].path, FA_READ) == FR_OK) {
             track_starts[t] = wav_data_offset(&track_files[t]);
+            track_loop_start[t] = track_starts[t];
             track_ok[t] = true;
         } else {
             printf("[c1] cannot open %s\n", tracks[t].path);
+        }
+
+        // azalea city doesn't loop from the beginning
+        if (t == 11) {
+            track_loop_start[11] = track_loop_start[11] + 4125068;
+            printf("[c1] setting track 11 start to 4125068 \n");
         }
     }
 
@@ -442,14 +457,9 @@ static void core1_entry(void) {
 
                 // if we get to the end of the file, start from beginning again
                 if (samples_read < MIX_SAMPLES) {
-                    f_lseek(&track_files[lt], track_starts[lt]);
+                    f_lseek(&track_files[lt], track_loop_start[lt]);
                     br = 0;
                     f_read(&track_files[lt], music_raw, MIX_SAMPLES * sizeof(int16_t), &br);
-                    // int got = (int)(br / sizeof(int16_t));
-
-                    // if (got < MIX_SAMPLES) {
-                    //     memset(music_raw + got, 0, (MIX_SAMPLES - got) * sizeof(int16_t));
-                    // }
                 }
             } else {
                 // Need ~= (MIX_SAMPLES-1)*speed + 2 input samples for linear interpolation.
@@ -467,7 +477,8 @@ static void core1_entry(void) {
                     filled += got;
                     if (got < want) {
                         // EOF: wrap and continue reading.
-                        f_lseek(&track_files[lt], track_starts[lt]);
+                        // f_lseek(&track_files[lt], track_starts[lt]);
+                        f_lseek(&track_files[lt], track_loop_start[lt]);
                         if (got == 0) {
                             break; // defensive: avoid infinite loop on read error
                         }
@@ -563,7 +574,6 @@ int main(void) {
     stdio_init_all();
     tusb_init();
     // while (!stdio_usb_connected()) sleep_ms(100);
-
 
 
     printf("Pokemon SD player starting...\n");
@@ -691,6 +701,10 @@ int main(void) {
     gpio_init(SHIFT_PIN);
     gpio_set_dir(SHIFT_PIN, GPIO_IN);
     gpio_pull_up(SHIFT_PIN);
+
+    gpio_init(SHIFT_LED_PIN);
+    gpio_set_dir(SHIFT_LED_PIN, GPIO_OUT);
+    gpio_pull_up(SHIFT_LED_PIN);
 
     for (int s = 0; s < NUM_SFX_BUTTONS; s++) {
         prev_sfx_in[s] = false;
@@ -863,6 +877,8 @@ int main(void) {
             }
         }
 
+        gpio_put(SHIFT_LED_PIN, !gpio_get(SHIFT_PIN) ? 1 : 0);
+
         for (int m = 0; m < NUM_MUSIC_BUTTONS; m++) {
             bool in = !gpio_get(music_button_pin[m]);
             if (in && !prev_music_in[m]) {
@@ -963,6 +979,7 @@ int main(void) {
             music_speed_q16 = speed_smooth_q16;
 
             uint32_t sp = speed_smooth_q16;
+            // TODO: log sp target too??
             if (last_logged_speed_q16 == UINT32_MAX) {
                 printf("speed: adc %4u  speed %u/65536 (initial)\n", sp_adc, sp);
                 last_logged_speed_q16 = sp;
